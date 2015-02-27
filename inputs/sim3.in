@@ -1,0 +1,16 @@
+0.0 15 mpc ! inner outer radius
+3         ! test problem
+3.558e24  ! core radius (cm)
+3.2       ! core density (cm^-3)
+1.0       ! clumping factor
+1.0e4     ! initial temperature (K)
+n         ! isothermal (y/n)
+1.7e-14,1.7e-14,0.0,0.0    ! Gamma (s^-1)
+P          !
+2       ! input is eddington efficiency parameter
+2e3        ! eddington efficiency parameter (2e9 M0)
+2.5        ! power law index
+13.6 5440  ! min max freq   ! not implemented right now
+1e6        ! end time /years
+1000      !number of time steps 
+1e3      ! time between outputs

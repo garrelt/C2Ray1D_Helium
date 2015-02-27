@@ -1,0 +1,493 @@
+!>
+!! \brief This module contains routines for calculating the ionization and temperature evolution of the entire grid (1D).
+!!
+!! Module for Capreole / C2-Ray (f90)
+!!
+!! \b Author: Garrelt Mellema
+!!
+!! \b Date:
+!!
+!! \b Version: 1D version similar to the 3D version.
+
+module evolve
+
+  ! This module contains routines having to do with the calculation of
+  ! the ionization evolution of the entire grid (1D).
+
+  ! Version:
+  ! 1D version similar to the 3D version.
+
+  use precision, only: dp
+  use file_admin, only: logf
+  use my_mpi ! supplies all the MPI definitions
+  use sizes, only: Ndim, mesh
+  use grid, only: x,vol,dr
+  use material, only: ndens, xHI, xHII, xHeI, xHeII, xHeIII, temper 
+  use photonstatistics, only: state_before, calculate_photon_statistics, &
+       photon_loss
+  use abundances, only: abu_he
+  implicit none
+
+  !private
+
+  public :: evolve1D !> evolve 1D grid
+
+  !> H column density at the back end of the cell
+  real(kind=dp),dimension(mesh),save :: coldens_out_HI
+  !> He0 column density at the back end of the cell
+  real(kind=dp),dimension(mesh),save :: coldens_out_HeI
+  !> He1 column density at the back end of the cell
+  real(kind=dp),dimension(mesh),save :: coldens_out_HeII
+  integer :: smoothlim=0
+
+  integer :: counter=0
+contains
+
+  ! =======================================================================
+
+  !> Calculates the evolution of the hydrogen ionization state
+  !! and temperature for the whole 1D grid\n
+  !! \b Author: Garrelt Mellema\n
+  !! \b Date: 21-Aug-2006 (f77/OMP: 13-Jun-2005)\n
+  !! \b Version: Simple 1D
+
+  !subroutine evolve1D (dt)
+  subroutine evolve1D (dt,front_pos)
+
+    ! Calculates the evolution of the hydrogen ionization state
+
+    ! Author: Garrelt Mellema
+
+    ! Date: 21-Aug-2006 (f77/OMP: 13-Jun-2005)
+
+    ! Version: Simple 1D
+
+    ! History:
+    ! 11-Jun-2004 (GM) : grid arrays now passed via common (in grid.h)
+    ! and material arrays also (in material.h).
+    ! 11-Jun-2004 (GM) : adapted for multiple sources.
+    ! 3-Jan-2005 (GM) : reintegrated with updated Ifront3D
+    ! 20-May-2005 (GM) : split original eveolve0D into two routines
+    ! 13-Jun-2005 (HM) : OpenMP version : Hugh Merz
+    ! 31-Mar-2008 (GM) : clean up.
+
+    !> The time step
+    real(kind=dp),intent(in) :: dt
+    integer,intent(in) :: front_pos
+    !> Will contain the integer position of the cell being treated
+    integer :: pos
+
+    ! Loop variables
+    integer :: i
+    logical,save :: too_less_photon
+
+    ! Initial state (for photon statistics)
+    call state_before ()
+
+    ! reset photon loss counter
+    photon_loss=0.0
+
+    too_less_photon = .false.
+
+    ! Put column densities to zero
+    coldens_out_HI(:)=0.0
+    coldens_out_HeI(:)=0.0
+    coldens_out_HeII(:)=0.0
+
+    ! Loop through grid
+    do i=1,mesh
+       pos=i
+       if (too_less_photon.eqv..true.) exit
+       call evolve0D(dt,pos,front_pos,too_less_photon)
+    end do
+
+    ! Calculate photon statistics
+    call calculate_photon_statistics (dt)
+
+    return
+end subroutine evolve1D
+
+
+  !=======================================================================
+
+  !> Calculates the evolution of the hydrogen ionization state in a
+  !! single cell.\n
+  !! \b Author: Garrelt Mellema\n
+  !! \b Date: 21-Aug-2006 (20-May-2005, 5-Jan-2005, 02 Jun 2004)\n
+  !! \b Version: single source
+
+  !subroutine evolve0D(dt,current_pos)
+  subroutine evolve0D(dt,current_pos,front_pos,too_less_photon)
+
+    ! Calculates the evolution of the hydrogen ionization state in a
+    ! single cell.
+
+    ! Author: Garrelt Mellema, Martina M. Friedrich (helium)
+
+    ! Date: 21-Aug-2006 (20-May-2005, 5-Jan-2005, 02 Jun 2004)
+
+    ! Version: single sources, fixed temperature
+
+    ! Multiple sources
+    ! We call this routine for every grid point and for every source (ns).
+    ! The photo-ionization rates for each grid point are found and added
+    ! to phih_grid, but the ionization fractions are not updated.
+
+    use mathconstants, only: pi
+    use tped, only: electrondens
+    use doric_module, only: doric, coldens, coldens_bndry_HI, &
+         coldens_bndry_HeI,coldens_bndry_HeII
+    use radiation, only: photoion, photrates, pl_photon_rate
+    use c2ray_parameters, only: epsilon,convergence1,convergence2,convergence_frac,convergence_frac2,&
+                                convergence4
+    use material, only: isothermal, ionstates, gamma_uvb
+    use thermalevolution, only: thermal
+    use cgsconstants,only : ini_rec_colion_factors,breche1
+    use cgsphotoconstants, only: sigma_H_heth, sigma_H_heLya,sigma_He_heLya,sigma_HeI_at_ion_freq,&
+ sigma_He_he2,sigma_HeII_at_ion_freq,sigma_He_he2,sigma_H_he2
+
+    implicit none
+
+real(kind=dp),parameter :: max_coldens_HI=2.0e26 !< column density for stopping chemisty
+
+    logical :: falsedummy ! always false, for tests
+    parameter(falsedummy=.false.)
+
+    !> The time step
+    real(kind=dp),intent(in) :: dt
+    !> mesh position of cell being done
+    integer,intent(in) :: current_pos
+    integer,intent(in) :: front_pos
+    integer :: i_iteration
+    integer :: pos, nx
+    integer,dimension(Ndim) :: srcpos1
+    real(kind=dp) :: temp_coldens_cell_HI
+    real(kind=dp) :: temp_coldens_cell_HeI
+    real(kind=dp) :: temp_coldens_cell_HeII
+    real(kind=dp) :: coldens_in_HI, temp_coldens_out_HI
+    real(kind=dp) :: coldens_in_HeI, temp_coldens_out_HeI
+    real(kind=dp) :: coldens_in_HeII, temp_coldens_out_HeII
+    real(kind=dp) :: path
+    real(kind=dp) :: ndens_electron,intermediate_ion_avg_HI,intermediate_ion_avg_HeI,intermediate_ion_avg_HeII
+    real(kind=dp) :: ndens_element
+    real(kind=dp) :: tau_H_heth, tau_H_heLya,tau_He_heth,tau_He_heLya,y,z
+    real(kind=dp) :: y2a,y2b,tau_He2_he2th,tau_He_he2th,tau_H_he2th
+    real(kind=dp) :: vol_ph
+    real(kind=dp) :: begin_temper,end_temper,avg_temper,prev_temper,avhe0,avh,intermediate_ion_end_HI,intermediate_ion_end_HII
+    real(kind=dp) :: prev_avg_HI,prev_avg_HII,prev_avg_HeI,prev_avg_HeII,prev_avg_HeIII
+    real(kind=dp) :: intermediate_ion_end_HeI,intermediate_ion_end_HeII,intermediate_ion_end_HeIII
+    real(kind=dp) :: convergence
+    real(kind=dp) :: photon_number
+    type(ionstates) :: ion
+    type(photrates) :: phi
+    logical,intent(inout) :: too_less_photon
+
+    convergence=convergence1
+
+    pos=current_pos
+
+    !copy the ionization states of the previous time-step
+
+    ion%begin_HI=xHI(pos)
+    ion%avg_HI=xHI(pos)
+    ion%end_HI=xHI(pos)
+
+    ion%begin_HII=xHII(pos)
+    ion%avg_HII=xHII(pos)
+    ion%end_HII=xHII(pos)
+
+    ion%begin_HeI=xHeI(pos)
+    ion%avg_HeI=xHeI(pos)
+    ion%end_HeI=xHeI(pos)
+
+    ion%begin_HeII=xHeII(pos)
+    ion%avg_HeII=xHeII(pos)
+    ion%end_HeII=xHeII(pos)
+
+    ion%begin_HeIII=xHeIII(pos)
+    ion%avg_HeIII=xHeIII(pos)
+    ion%end_HeIII=xHeIII(pos)
+
+    !copy the temperature of the previous time-step
+    begin_temper=temper(pos)
+    avg_temper=temper(pos)
+    end_temper=temper(pos)
+
+    !copy number density of the previous time-step
+    ndens_element=ndens(pos,1,1)
+
+    !copy outgoing column density of previous cell 
+    !as the incoming column density of current cell
+    if (pos.eq.1) then
+       coldens_in_HI = coldens_bndry_HI()
+       coldens_in_HeI = coldens_bndry_HeI()
+       coldens_in_HeII = coldens_bndry_HeII()
+    else
+       coldens_in_HI = coldens_out_HI(pos-1)
+       coldens_in_HeI = coldens_out_HeI(pos-1)
+       coldens_in_HeII = coldens_out_HeII(pos-1)
+    endif
+
+    ! Cell size
+    path=dr(1)
+
+    ! Find the volume of the shell this cell is part of (dilution factor)
+    vol_ph=vol(pos)
+
+    ! Iterate to get mean ionization state (column density / optical depth)
+    ! in cell
+    i_iteration=0
+
+
+    if (coldens_in_HI.le.max_coldens_HI) then
+
+      do
+
+      i_iteration=i_iteration+1
+          !write(33,*) 'forever in ', front_pos, ' and ', pos
+
+          ! Save the value of yh_av found in the previous iteration
+          prev_avg_HI=ion%avg_HI
+          prev_avg_HII=ion%avg_HII
+          prev_avg_HeI=ion%avg_HeI
+          prev_avg_HeII=ion%avg_HeII
+          prev_avg_HeIII=ion%avg_HeIII
+          prev_temper=end_temper
+
+          !-----------PHOTOION BLOCK-----------------------------------------------
+
+          ! Update current cell average column density of HI, HeI and HeII
+
+          temp_coldens_cell_HI =coldens(path,ion%avg_HI,ndens_element,(1.0_dp-abu_he))
+          temp_coldens_cell_HeI=coldens(path,ion%avg_HeI,ndens_element,abu_he)
+          temp_coldens_cell_HeII=coldens(path,ion%avg_HeII,ndens_element,abu_he)
+
+          ! Update outgoing average column density of HI, HeI and HeII
+
+          temp_coldens_out_HI= coldens_in_HI+temp_coldens_cell_HI
+          temp_coldens_out_HeI = coldens_in_HeI+temp_coldens_cell_HeI  
+          temp_coldens_out_HeII = coldens_in_HeII+temp_coldens_cell_HeII     
+
+          call photoion(phi,coldens_in_HI,temp_coldens_out_HI,coldens_in_HeI,temp_coldens_out_HeI,coldens_in_HeII,&
+                        temp_coldens_out_HeII,vol_ph,1,ion%avg_HII)
+
+           ! if (pos.eq.1) write(*,*) phi%photo_in, pl_photon_rate
+
+          if (phi%photo_in/pl_photon_rate.le.convergence4) then
+
+            too_less_photon = .true.
+          endif
+
+          ! True photoionization rate
+          phi%photo_cell_HI=phi%photo_cell_HI/(ndens_element*(1.0_dp-abu_he)*ion%avg_HI)
+          phi%photo_cell_HeI=phi%photo_cell_HeI/(ndens_element*abu_he*ion%avg_HeI)
+          phi%photo_cell_HeII=phi%photo_cell_HeII/(ndens_element*abu_he*ion%avg_HeII)
+
+          ! Add the UV background
+          phi%photo_cell_HI=phi%photo_cell_HI + gamma_uvb(1)
+          phi%photo_cell_HeI=phi%photo_cell_HeI + gamma_uvb(2)
+          phi%photo_cell_HeII=phi%photo_cell_HeII + gamma_uvb(3)
+
+ 
+          ! Update current cell average electron density
+
+          ndens_electron=electrondens(ndens_element,ion%avg_HII,ion%avg_HeII,ion%avg_HeIII)
+
+
+          !Update the collisional ion and recombination rates for new temperature
+
+          if (.not.isothermal) call ini_rec_colion_factors(avg_temper) 
+
+          !----------------DORIC BLOCK---------------------------------------------
+
+          !These are the specific optical depth in order to find out y,z,y2a,y2b
+
+          temp_coldens_cell_HI =coldens(path,ion%avg_HI, ndens_element,(1.0_dp-abu_he)) 
+          temp_coldens_cell_HeI=coldens(path,ion%avg_HeI,ndens_element, abu_he)
+          temp_coldens_cell_HeII=coldens(path,ion%avg_HeII,ndens_element,abu_he)
+
+          tau_H_heth = temp_coldens_cell_HI*sigma_H_heth 
+          tau_He_heth = temp_coldens_cell_HeI*sigma_HeI_at_ion_freq 
+          tau_H_heLya = temp_coldens_cell_HI*sigma_H_heLya 
+          tau_He_heLya= temp_coldens_cell_HeI*sigma_He_heLya 
+          tau_He2_he2th = temp_coldens_cell_HeII*sigma_HeII_at_ion_freq
+          tau_He_he2th = temp_coldens_cell_HeI* sigma_He_he2
+          tau_H_he2th = temp_coldens_cell_HI*sigma_H_he2
+
+          !Parameters required to define the coupled ODEs
+
+          y= tau_H_heth /(tau_H_heth +tau_He_heth)
+          z= tau_H_heLya/(tau_H_heLya+tau_He_heLya)
+          y2a= tau_He2_he2th /(tau_He2_he2th +tau_He_he2th+tau_H_he2th)
+          y2b= tau_He_he2th /(tau_He2_he2th +tau_He_he2th+tau_H_he2th)
+
+          call doric(dt,ndens_electron,ion,phi,y,z,y2a,y2b,pos)! 
+          !-----------------------------------------------------------------------
+
+          ! Update current cell average electron density
+
+          ndens_electron=electrondens(ndens_element,ion%avg_HII,ion%avg_HeII,ion%avg_HeIII)
+
+          !----------------DORIC BLOCK---------------------------------------------
+
+          ! Update current cell avergae column density of HI, HeI and HeII
+
+          temp_coldens_cell_HI =coldens(path,ion%avg_HI, ndens_element,(1.0_dp-abu_he)) 
+          temp_coldens_cell_HeI=coldens(path,ion%avg_HeI,ndens_element, abu_he)
+          temp_coldens_cell_HeII=coldens(path,ion%avg_HeII,ndens_element,abu_he)
+ 
+          !These are the specific optical depth in order to find out y,z,y2a,y2b
+
+          tau_H_heth = temp_coldens_cell_HI *sigma_H_heth
+          tau_He_heth = temp_coldens_cell_HeI*sigma_HeI_at_ion_freq  
+          tau_H_heLya = temp_coldens_cell_HI*sigma_H_heLya 
+          tau_He_heLya= temp_coldens_cell_HeI*sigma_He_heLya 
+          tau_He2_he2th = temp_coldens_cell_HeII*sigma_HeII_at_ion_freq
+          tau_He_he2th = temp_coldens_cell_HeI* sigma_He_he2
+          tau_H_he2th = temp_coldens_cell_HI*sigma_H_he2
+
+          !Parameters required to define the coupled ODEs
+
+          y= tau_H_heth /(tau_H_heth +tau_He_heth)
+          z= tau_H_heLya/(tau_H_heLya+tau_He_heLya)
+          y2a= tau_He2_he2th /(tau_He2_he2th +tau_He_he2th+tau_H_he2th)
+          y2b= tau_He_he2th /(tau_He2_he2th +tau_He_he2th+tau_H_he2th)
+
+          !Save the ionization results of the previous doric
+
+          
+          intermediate_ion_end_HI=ion%end_HI
+          intermediate_ion_end_HII=ion%end_HII
+          intermediate_ion_end_HeI=ion%end_HeI
+          intermediate_ion_end_HeII=ion%end_HeII
+          intermediate_ion_end_HeIII=ion%end_HeIII
+          intermediate_ion_avg_HI=ion%avg_HI
+          intermediate_ion_avg_HeI=ion%avg_HeI
+          intermediate_ion_avg_HeII=ion%avg_HeII
+
+          call doric(dt,ndens_electron,ion,phi, y, z,y2a,y2b,pos)
+
+          !-----------------------------------------------------------------------
+
+          !Average the ionization results of two dorics.
+
+          ion%end_HI=0.5*(ion%end_HI+intermediate_ion_end_HI)
+          ion%end_HII=0.5*(ion%end_HII+intermediate_ion_end_HII)
+          ion%end_HeI=0.5*(ion%end_HeI+intermediate_ion_end_HeI)
+          ion%end_HeII=0.5*(ion%end_HeII+intermediate_ion_end_HeII)
+          ion%end_HeIII=0.5*(ion%end_HeIII+intermediate_ion_end_HeIII)
+          ion%avg_HI=0.5*(ion%avg_HI+intermediate_ion_avg_HI)
+          ion%avg_HeI=0.5*(ion%avg_HeI+intermediate_ion_avg_HeI)
+          ion%avg_HeII=0.5*(ion%avg_HeII+intermediate_ion_avg_HeII)
+
+          ndens_electron=electrondens(ndens_element,ion%avg_HII,ion%avg_HeII,ion%avg_HeIII)
+
+          end_temper=begin_temper ! set temper1 to the original temperature
+
+          ! If at the first iteration the change of ionization fractions are obvious
+          ! then we skip the thermal subroutine
+            if (i_iteration.eq.1.and.abs(ion%begin_HI-ion%end_HI).gt.0.1 .and. &
+               abs(ion%begin_HeI-ion%end_HeI).gt.0.1) then
+            continue
+              else
+            if (.not.isothermal) call thermal(dt,end_temper,avg_temper,ndens_electron,ndens_element,ion,phi,pos)
+
+            endif
+
+            ! Convergence test
+            if( ( (abs(ion%avg_HI-prev_avg_HI)/ion%avg_HI.lt.convergence) &
+               .or. &
+               (ion%avg_HI.lt.convergence_frac) &
+               ) &
+               .and. &
+               ( (abs(ion%avg_HeI-prev_avg_HeI)/ion%avg_HeI.lt.convergence) &
+               .or. &
+               (ion%avg_HeI.lt.convergence_frac) &
+               ) &
+               .and. &
+               ( (abs(ion%avg_HeII-prev_avg_HeII)/ion%avg_HeII.lt.convergence) &
+               .or. &
+               (ion%avg_HeII.lt.convergence_frac) &
+               ) &           
+               .and. &
+               ( (abs(ion%avg_HeIII-prev_avg_HeIII)/ion%avg_HeIII.lt.convergence) &
+               .or. &
+               (ion%avg_HeIII.lt.convergence_frac) &
+               ) &   
+               .and. &
+               abs(end_temper-prev_temper)/end_temper.lt.convergence &
+               ) then
+
+               exit
+            else
+
+             ! when after 4000 iterations still not converge..
+            if (i_iteration.gt.4000) then
+                write(logf,*) 'Convergence failing'
+                write(logf,*) 'i_iteration=',i_iteration
+                write(logf,*) 'xh: ',ion%avg_HI,prev_avg_HI!, ion%h(0)
+                write(logf,*) 'xhe0: ',ion%avg_HeI, prev_avg_HeI!, ion%he(0)
+                write(logf,*) 'xhe0: ',ion%end_HeI
+                write(logf,*) 'xhe1: ',ion%avg_HeII, prev_avg_HeII!, ion%he(1)
+                write(logf,*) 'xhe2: ',ion%avg_HeIII, prev_avg_HeIII!, ion%he(2)
+                write(logf,*) 'temper: ',end_temper,prev_temper
+                write(logf,*) 'pos:', pos
+                write(logf,*) 'convcrits',abs(ion%avg_HI-prev_avg_HI)/ion%avg_HI, &
+                     abs(ion%avg_HeII-prev_avg_HeII)/ion%avg_HeII
+                write(logf,*) 'convcrits',abs(ion%avg_HeIII-prev_avg_HeIII)/ion%avg_HeIII, &
+                     abs(ion%avg_HeI-prev_avg_HeI)/ion%avg_HeI
+                !write(33,*) 'over 4000 iterations...'
+                exit
+            endif
+          endif !end of convergence test loop
+
+
+     enddo ! end of iteration
+
+     write(33,*) i_iteration, ' iterations, front pos is ', front_pos, ' at cell ', pos
+
+! when incoming optical depth is too big that no ionizing photons can reach the cell
+  else
+       phi%photo_cell_HI=0.0_dp
+       phi%photo_out_HI=0.0_dp
+       phi%photo_cell_HeI=0.0_dp
+       phi%photo_cell_HeII=0.0_dp
+       phi%photo_out_HeI=0.0_dp
+       phi%photo_out_HeII=0.0_dp
+  endif
+
+
+
+    !Copy the final ionization results back
+
+    xHI(pos)=ion%end_HI
+    xHII(pos)=ion%end_HII
+    xHeI(pos)=ion%end_HeI    
+    xHeII(pos)=ion%end_HeII  
+    xHeIII(pos)=ion%end_HeIII  
+
+    !if (front_pos.eq.pos) then
+    !  write(33,*) 'at position ', front_pos, ' xHI is ', xHI(front_pos)
+    !endif
+
+    if (§front_pos.eq.301) then
+      write(33,*) 'attention! ',xHI(pos), xHII(pos), xHeI(pos), xHeII(pos), xHeIII(pos) 
+    endif
+
+    ! Copy the final temperature back
+    temper(pos)=end_temper
+
+    ! Copy the final outgoing column densities back
+    coldens_out_HI(pos)  =coldens_in_HI+ &
+                         coldens(path,ion%avg_HI,ndens_element,(1.0_dp-abu_he))
+    coldens_out_HeI(pos) =coldens_in_HeI+ &
+                         coldens(path,ion%avg_HeI,ndens_element,abu_he)
+    coldens_out_HeII(pos)=coldens_in_HeII+ &
+                         coldens(path,ion%avg_HeII,ndens_element,abu_he)
+
+    ! Photon statistics: register number of photons leaving the grid
+    if (pos.eq.mesh) photon_loss=0.0_dp
+
+  end subroutine evolve0D
+
+end module evolve

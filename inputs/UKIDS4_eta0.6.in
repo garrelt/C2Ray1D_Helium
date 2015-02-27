@@ -1,0 +1,22 @@
+0.0 15 mpc ! grid
+5          ! test problem number  
+7.085        ! redshift
+0.0        ! overdensity
+1.0e0      ! clumping factor
+10000      ! initial temperature (K)
+n          ! isothermal (y/n)
+3.0e-17,3.0e-17,0.0    ! Gamma (s^-1)    1.4e-16,1.4e-16,0.0
+P          !
+1       ! input is eddington efficiency parameter
+0.5e57         Rate of ionizing photons is specified
+2.5        ! power law index
+13.6 5440  ! min max freq   ! not implemented right now
+1e7        ! end time /years
+1000      !number of time steps 
+1e4      ! time between outputs
+
+
+
+
+
+
